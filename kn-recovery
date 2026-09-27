@@ -1,0 +1,958 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+kn-recovery — восстановление KeeneticOS по TFTP из командной строки Linux.
+
+Свободная замена Windows-утилите krutil_en.exe («Keenetic Operating System
+Recovery»). Роутер в режиме восстановления сам забирает файл прошивки
+с TFTP-сервера на компьютере, поэтому программа ничего не пишет в роутер:
+она только слушает порт 69 и отдаёт файл по запросу.
+
+Протокол и формат прошивки восстановлены разбором krutil_en.exe,
+подробности — в PROTOCOL.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+import zlib
+
+__version__ = "1.0.0"
+
+# ------------------------------------------------------------------ протокол
+
+TFTP_PORT = 69
+OP_RRQ = 1
+OP_WRQ = 2
+OP_DATA = 3
+OP_ACK = 4
+OP_ERROR = 5
+OP_OACK = 6
+
+ERR_NAMES = {
+    0: "не определено",
+    1: "файл не найден",
+    2: "доступ запрещён",
+    3: "диск переполнен",
+    4: "недопустимая операция",
+    5: "неизвестный идентификатор передачи",
+    6: "файл уже существует",
+    7: "нет такого пользователя",
+}
+
+# Адреса, которые использует режим восстановления Keenetic.
+PC_IP = "192.168.1.2"
+PC_PREFIX = 24
+ROUTER_IP = "192.168.1.1"
+
+DEFAULT_BLKSIZE = 512
+DEFAULT_TIMEOUT = 1.0
+DEFAULT_RETRIES = 6
+
+# ------------------------------------------------------------------ прошивка
+
+TRAILER_LEN = 0x3C
+TRAILER_MAGIC = b"ZNBG"
+MIN_FW_SIZE = 0x100000
+MODEL_OFFSET = 8
+FLAGS_OFFSET = 4
+CRC_OFFSET = 0x38
+
+UIMAGE_MAGIC = 0x27051956
+
+
+class FirmwareError(Exception):
+    """Прошивка не читается или не похожа на образ Keenetic."""
+
+
+class Firmware:
+    """Образ Keenetic: uImage плюс 60-байтовый трейлер ZNBG.
+
+    Раскладка трейлера (все поля little-endian):
+
+        +0x00  4 байта   магия 'ZNBG'
+        +0x04  u32       флаги/тип образа
+        +0x08  строка    имя модели, например 'KN-1221'
+        +0x38  u32       CRC32 тела: ~zlib.crc32(data[:-0x3c])
+    """
+
+    def __init__(self, path, data, model, flags, crc_stored, crc_calc, uimage):
+        self.path = path
+        self.data = data
+        self.model = model
+        self.flags = flags
+        self.crc_stored = crc_stored
+        self.crc_calc = crc_calc
+        self.uimage = uimage
+
+    @property
+    def size(self):
+        return len(self.data)
+
+    @property
+    def crc_ok(self):
+        return self.crc_stored == self.crc_calc
+
+    @property
+    def version(self):
+        return self.uimage["version"] if self.uimage else None
+
+    @classmethod
+    def load(cls, path):
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            raise FirmwareError("не удалось прочитать %s: %s" % (path, exc))
+
+        if len(data) < MIN_FW_SIZE:
+            raise FirmwareError(
+                "файл слишком мал (%d байт, минимум %d) — это не образ Keenetic"
+                % (len(data), MIN_FW_SIZE)
+            )
+
+        trailer = data[len(data) - TRAILER_LEN:]
+        if trailer[:4] != TRAILER_MAGIC:
+            raise FirmwareError(
+                "не найдена подпись ZNBG в конце файла — образ повреждён "
+                "или это прошивка другой системы"
+            )
+
+        model = trailer[MODEL_OFFSET:].split(b"\0")[0].decode("ascii", "replace").strip()
+        if not model:
+            raise FirmwareError("в трейлере нет имени модели")
+
+        flags = struct.unpack_from("<I", trailer, FLAGS_OFFSET)[0]
+        crc_stored = struct.unpack_from("<I", trailer, CRC_OFFSET)[0]
+        crc_calc = (~zlib.crc32(data[:len(data) - TRAILER_LEN])) & 0xFFFFFFFF
+
+        return cls(path, data, model, flags, crc_stored, crc_calc, _parse_uimage(data))
+
+    def expected_names(self):
+        """Имена, которые роутер может запросить по TFTP."""
+        names = []
+        base = os.path.basename(self.path)
+        if base:
+            names.append(base)
+        for candidate in ("%s_recovery.bin" % self.model, "%s.bin" % self.model):
+            if candidate not in names:
+                names.append(candidate)
+        return names
+
+    def matches_name(self, name):
+        return name in self.expected_names()
+
+
+def _parse_uimage(data):
+    """Заголовок uImage (64 байта) — оттуда берём версию ядра."""
+    if len(data) < 64:
+        return None
+    try:
+        fields = struct.unpack_from(">IIIIIIIBBBB32s", data, 0)
+    except struct.error:
+        return None
+    magic = fields[0]
+    if magic != UIMAGE_MAGIC:
+        return None
+    name = fields[11].split(b"\0")[0].decode("latin1", "replace")
+    return {
+        "name": name,
+        "data_size": fields[3],
+        "load_addr": fields[4],
+        "entry": fields[5],
+        "os_id": fields[7],
+        "arch": fields[8],
+        "image_type": fields[9],
+        "compression": fields[10],
+        "version": name.strip() or None,
+    }
+
+
+# ------------------------------------------------------------- система (Linux)
+
+
+class SystemError_(Exception):
+    """Ошибка работы с сетью или системными утилитами."""
+
+
+def run(cmd, timeout=15):
+    """Запустить команду, вернуть (код, stdout, stderr)."""
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except FileNotFoundError:
+        return 127, "", "команда не найдена: %s" % cmd[0]
+    except subprocess.SubprocessError as exc:
+        return 1, "", str(exc)
+
+
+def have(tool):
+    return shutil.which(tool) is not None
+
+
+def list_interfaces():
+    try:
+        return sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return []
+
+
+# Интерфейсы, которые заведомо не могут вести к роутеру в режиме восстановления.
+VIRTUAL_PREFIXES = (
+    "lo", "docker", "veth", "virbr", "br-", "tun", "tap", "wg", "awg",
+    "zt", "tailscale", "ppp", "sit", "gre", "ip6tnl", "dummy", "csqtt",
+)
+
+
+def is_physical(iface):
+    """Есть ли у интерфейса реальное устройство (а не туннель/мост)."""
+    return os.path.exists("/sys/class/net/%s/device" % iface)
+
+
+def iface_carrier(iface):
+    """Есть ли линк на интерфейсе: True/False/None (неизвестно)."""
+    try:
+        with open("/sys/class/net/%s/carrier" % iface) as fh:
+            return fh.read().strip() == "1"
+    except OSError:
+        return None
+
+
+def iface_speed(iface):
+    try:
+        with open("/sys/class/net/%s/speed" % iface) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def iface_addrs(iface):
+    """IPv4-адреса интерфейса в виде списка (адрес, префикс)."""
+    if not have("ip"):
+        return []
+    rc, out, _ = run(["ip", "-4", "-o", "addr", "show", "dev", iface])
+    if rc != 0:
+        return []
+    found = []
+    for line in out.splitlines():
+        parts = line.split()
+        if "inet" not in parts:
+            continue
+        cidr = parts[parts.index("inet") + 1]
+        addr, _, prefix = cidr.partition("/")
+        found.append((addr, int(prefix or 32)))
+    return found
+
+
+def iface_has_ip(iface, addr):
+    return any(a == addr for a, _ in iface_addrs(iface))
+
+
+def iface_add_ip(iface, cidr):
+    rc, _, err = run(["ip", "addr", "add", cidr, "dev", iface])
+    if rc != 0:
+        raise SystemError_("не удалось добавить %s на %s: %s" % (cidr, iface, err))
+
+
+def iface_del_ip(iface, cidr):
+    run(["ip", "addr", "del", cidr, "dev", iface])
+
+
+def arp_probe(iface, ip, timeout=2.0):
+    """Заставить ядро разрешить адрес и вернуть MAC из таблицы соседей."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Отправка в закрытый порт нужна только чтобы вызвать ARP-запрос.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                        iface.encode() + b"\0")
+    except OSError:
+        pass
+    try:
+        sock.sendto(b"\0", (ip, 9))
+    except OSError:
+        pass
+    finally:
+        sock.close()
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rc, out, _ = run(["ip", "-4", "neigh", "show", ip])
+        if rc == 0 and out:
+            parts = out.split()
+            if "lladdr" in parts:
+                mac = parts[parts.index("lladdr") + 1]
+                state = parts[-1].upper()
+                if state not in ("FAILED", "INCOMPLETE"):
+                    return mac, state
+        time.sleep(0.25)
+    return None, None
+
+
+# --------------------------------------------------------------------- вывод
+
+
+class Log:
+    """Вывод с необязательными цветами и уровнями."""
+
+    def __init__(self, color=None, quiet=False):
+        if color is None:
+            color = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+        self.color = color
+        self.quiet = quiet
+        # В файл или канал прогресс построчно засоряет вывод, поэтому
+        # обновляем строку только на терминале.
+        self.tty = sys.stdout.isatty()
+        self._progress_len = 0
+        self._last_pct = -1
+
+    def _c(self, code, text):
+        return "\033[%sm%s\033[0m" % (code, text) if self.color else text
+
+    def step(self, text):
+        if not self.quiet:
+            self.clear_progress()
+            print(self._c("1;36", "==> ") + text, flush=True)
+
+    def info(self, text):
+        if not self.quiet:
+            print("    " + text, flush=True)
+
+    def ok(self, text):
+        if self.quiet:
+            return
+        self.clear_progress()
+        print("    " + self._c("32", "[+] ") + text, flush=True)
+
+    def warn(self, text):
+        if self.quiet:
+            return
+        self.clear_progress()
+        print("    " + self._c("33", "[!] ") + text, flush=True)
+
+    def err(self, text):
+        if self.quiet:
+            return
+        self.clear_progress()
+        print("    " + self._c("31", "[x] ") + text, file=sys.stderr, flush=True)
+
+    def progress(self, done, total, suffix=""):
+        if self.quiet:
+            return
+        pct = (done * 100 // total) if total else 100
+        if not self.tty:
+            # Не терминал: отмечаем только каждые 10 %.
+            if pct // 10 != self._last_pct // 10:
+                self._last_pct = pct
+                print("    %3d%%  %s / %s" % (pct, human_size(done),
+                                              human_size(total)), flush=True)
+            return
+        line = "    %3d%%  %s / %s %s" % (
+            pct, human_size(done), human_size(total), suffix
+        )
+        pad = max(0, self._progress_len - len(line))
+        sys.stdout.write("\r" + line + " " * pad)
+        sys.stdout.flush()
+        self._progress_len = len(line)
+
+    def clear_progress(self):
+        if self._progress_len:
+            sys.stdout.write("\r" + " " * self._progress_len + "\r")
+            sys.stdout.flush()
+            self._progress_len = 0
+
+
+def human_size(n):
+    if n < 1024:
+        return "%d Б" % n
+    if n < 1024 * 1024:
+        return "%.1f КиБ" % (n / 1024)
+    return "%.2f МиБ" % (n / 1024 / 1024)
+
+
+# ------------------------------------------------------------------ TFTP
+
+
+class TransferError(Exception):
+    """Передача прервана."""
+
+
+def parse_request(pkt):
+    """Разобрать RRQ/WRQ: (opcode, имя файла, режим, опции)."""
+    if len(pkt) < 4:
+        raise ValueError("пакет короче 4 байт")
+    opcode = struct.unpack_from("!H", pkt, 0)[0]
+    if opcode not in (OP_RRQ, OP_WRQ):
+        raise ValueError("это не запрос передачи (opcode=%d)" % opcode)
+
+    parts = pkt[2:].split(b"\0")
+    if len(parts) < 2:
+        raise ValueError("в запросе нет имени файла или режима")
+
+    filename = parts[0].decode("utf-8", "replace")
+    mode = parts[1].decode("ascii", "replace")
+
+    options = {}
+    rest = parts[2:]
+    for i in range(0, len(rest) - 1, 2):
+        if rest[i] == b"":
+            break
+        key = rest[i].decode("ascii", "replace").lower()
+        val = rest[i + 1].decode("ascii", "replace")
+        options[key] = val
+
+    return opcode, filename, mode, options
+
+
+def parse_error(pkt):
+    """Разобрать ERROR-пакет: (код, текст)."""
+    code = struct.unpack_from("!H", pkt, 2)[0]
+    msg = pkt[4:].split(b"\0")[0].decode("utf-8", "replace")
+    return code, msg
+
+
+def error_packet(code, message):
+    return struct.pack("!HH", OP_ERROR, code) + message.encode("utf-8") + b"\0"
+
+
+class TFTPServer:
+    """TFTP-сервер только на чтение: отдаёт один файл.
+
+    Поведение повторяет krutil_en.exe: слушаем порт 69, на RRQ открываем
+    отдельный сокет с эфемерным портом, подключаем его к клиенту и гоняем
+    DATA/ACK. Клиент (загрузчик Keenetic) сам решает, что делать с файлом.
+    """
+
+    def __init__(self, firmware, bind_ip="0.0.0.0", port=TFTP_PORT,
+                 blksize=DEFAULT_BLKSIZE, timeout=DEFAULT_TIMEOUT,
+                 retries=DEFAULT_RETRIES, expect_peer=ROUTER_IP,
+                 serve=True, log=None):
+        self.fw = firmware
+        self.bind_ip = bind_ip
+        self.port = port
+        self.blksize = blksize
+        self.timeout = timeout
+        self.retries = retries
+        self.expect_peer = expect_peer
+        self.serve = serve
+        self.log = log or Log(quiet=True)
+        self.detected = None
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self, max_wait=None):
+        """Слушать порт до первого запроса. Вернуть отчёт или None."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((self.bind_ip, self.port))
+        except PermissionError:
+            raise SystemError_(
+                "нет прав занять порт %d — запустите через sudo" % self.port
+            )
+        except OSError as exc:
+            raise SystemError_("не удалось занять порт %d: %s" % (self.port, exc))
+
+        sock.settimeout(0.5)
+        deadline = time.monotonic() + max_wait if max_wait else None
+        try:
+            while not self._stop:
+                if deadline and time.monotonic() > deadline:
+                    return None
+                try:
+                    pkt, peer = sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    continue
+
+                report = self._handle(sock, pkt, peer)
+                if report is not None:
+                    return report
+        finally:
+            sock.close()
+        return None
+
+    # -- обработка одного запроса -------------------------------------------
+
+    def _handle(self, listener, pkt, peer):
+        try:
+            opcode, filename, mode, options = parse_request(pkt)
+        except ValueError:
+            return None
+
+        report = {
+            "peer": peer,
+            "filename": filename,
+            "mode": mode,
+            "options": options,
+            "opcode": opcode,
+            "served": False,
+            "bytes": 0,
+            "name_matches": self.fw.matches_name(filename) if self.fw else None,
+            "peer_expected": (peer[0] == self.expect_peer) if self.expect_peer else None,
+        }
+        self.detected = report
+
+        self.log.clear_progress()
+        self.log.ok("РОУТЕР ОБНАРУЖЕН: %s:%d" % (peer[0], peer[1]))
+        self.log.info("запрошенный файл: %s" % filename)
+        self.log.info("режим передачи:   %s" % (mode or "не указан"))
+        if options:
+            self.log.info("опции клиента:    %s"
+                          % ", ".join("%s=%s" % kv for kv in sorted(options.items())))
+        if report["peer_expected"] is False:
+            self.log.warn("запрос пришёл не с %s — это не тот адрес, "
+                          "с которого обычно просит загрузчик Keenetic"
+                          % self.expect_peer)
+        if report["name_matches"] is False:
+            self.log.warn("имя файла не совпадает с прошивкой (%s)"
+                          % ", ".join(self.fw.expected_names()))
+
+        if opcode == OP_WRQ:
+            self.log.err("роутер пытается ЗАПИСАТЬ файл — kn-recovery этого не делает")
+            listener.sendto(error_packet(2, "read only"), peer)
+            return report
+
+        if not self.serve:
+            self.log.info("режим только обнаружения: файл не передаём")
+            return report
+
+        try:
+            sent = self._transfer(peer, filename)
+        except TransferError as exc:
+            self.log.err("передача прервана: %s" % exc)
+            report["error"] = str(exc)
+            return report
+
+        report["served"] = True
+        report["bytes"] = sent
+        self.log.clear_progress()
+        self.log.ok("передано %s (%d байт)" % (human_size(sent), sent))
+        return report
+
+    # -- сама передача ------------------------------------------------------
+
+    def _transfer(self, peer, filename):
+        data = self.fw.data
+        total = len(data)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((self.bind_ip, 0))
+        sock.connect(peer)
+        sock.settimeout(self.timeout)
+
+        try:
+            block = 1
+            offset = 0
+            self.log.info("передаю %s по %d байт в блоке"
+                          % (human_size(total), self.blksize))
+            while True:
+                chunk = data[offset:offset + self.blksize]
+                pkt = struct.pack("!HH", OP_DATA, block & 0xFFFF) + chunk
+                self._send_wait_ack(sock, pkt, block, offset, total)
+
+                offset += len(chunk)
+                self.log.progress(offset, total)
+
+                # Последний блок короче размера блока — конец файла.
+                if len(chunk) < self.blksize:
+                    break
+                block = (block + 1) & 0xFFFF
+
+            return offset
+        finally:
+            sock.close()
+
+    def _send_wait_ack(self, sock, pkt, block, offset, total):
+        """Отправить блок и дождаться ACK; при таймауте повторить."""
+        for attempt in range(1, self.retries + 1):
+            try:
+                sock.send(pkt)
+            except OSError as exc:
+                raise TransferError("не удалось отправить блок %d: %s" % (block, exc))
+
+            deadline = time.monotonic() + self.timeout
+            while time.monotonic() < deadline:
+                try:
+                    reply = sock.recv(65535)
+                except socket.timeout:
+                    break
+                except OSError as exc:
+                    raise TransferError("ошибка приёма: %s" % exc)
+
+                if len(reply) < 4:
+                    continue
+                opcode = struct.unpack_from("!H", reply, 0)[0]
+
+                if opcode == OP_ACK:
+                    acked = struct.unpack_from("!H", reply, 2)[0]
+                    if acked == (block & 0xFFFF):
+                        return
+                    # Чужой ACK — ждём нужный дальше.
+                    continue
+                if opcode == OP_ERROR:
+                    code, msg = parse_error(reply)
+                    raise TransferError("роутер вернул ошибку %d (%s): %s"
+                                        % (code, ERR_NAMES.get(code, "?"), msg))
+                # DATA/OACK от клиента в этой роли не ждём.
+
+            if attempt < self.retries:
+                self.log.clear_progress()
+                self.log.warn("нет подтверждения блока %d, повтор %d/%d"
+                              % (block, attempt, self.retries))
+                self.log.progress(offset, total)
+
+        raise TransferError(
+            "блок %d не подтверждён за %d попыток" % (block, self.retries)
+        )
+
+
+# --------------------------------------------------------------------- команды
+
+
+def pick_interface(explicit=None):
+    """Выбрать интерфейс: явный, затем с адресом 192.168.1.2, затем физический.
+
+    Туннели и мосты (awg0, docker0, br-lan и подобные) пропускаются: роутер
+    в режиме восстановления подключают кабелем к обычной сетевой карте.
+    """
+    if explicit:
+        if explicit not in list_interfaces():
+            raise SystemError_("интерфейс %s не найден" % explicit)
+        return explicit
+
+    ifaces = [i for i in list_interfaces() if i != "lo"]
+    if not ifaces:
+        raise SystemError_("в системе не найдено сетевых интерфейсов")
+
+    for name in ifaces:
+        if iface_has_ip(name, PC_IP):
+            return name
+
+    physical = [i for i in ifaces if is_physical(i)]
+    for name in physical:
+        if iface_carrier(name) is True:
+            return name
+    if physical:
+        return physical[0]
+
+    for name in ifaces:
+        if not name.startswith(VIRTUAL_PREFIXES):
+            return name
+
+    raise SystemError_(
+        "не найден подходящий сетевой интерфейс — укажите его через --interface"
+    )
+
+
+def check_interface(iface, log, set_ip=False, ip_added=None):
+    """Проверить интерфейс и при необходимости добавить адрес 192.168.1.2/24."""
+    log.step("Интерфейс %s" % iface)
+
+    carrier = iface_carrier(iface)
+    speed = iface_speed(iface)
+    if carrier is True:
+        extra = ""
+        if speed:
+            extra = " (%d Мбит/с)" % speed
+        log.ok("линк есть%s" % extra)
+    elif carrier is False:
+        log.warn("линка нет — проверьте кабель до роутера")
+    else:
+        log.info("состояние линка определить не удалось")
+
+    addrs = iface_addrs(iface)
+    if addrs:
+        log.info("адреса: %s" % ", ".join("%s/%d" % a for a in addrs))
+    else:
+        log.info("адресов IPv4 нет")
+
+    if iface_has_ip(iface, PC_IP):
+        log.ok("адрес %s уже настроен" % PC_IP)
+        return
+
+    if set_ip:
+        iface_add_ip(iface, "%s/%d" % (PC_IP, PC_PREFIX))
+        if ip_added is not None:
+            ip_added.append("%s/%d" % (PC_IP, PC_PREFIX))
+        log.ok("добавлен адрес %s/%d" % (PC_IP, PC_PREFIX))
+    else:
+        log.warn("нет адреса %s — загрузчик Keenetic ищет сервер именно там" % PC_IP)
+        log.info("добавьте вручную:  sudo ip addr add %s/%d dev %s"
+                 % (PC_IP, PC_PREFIX, iface))
+        log.info("или запустите с флагом --set-ip (адрес будет снят после работы)")
+
+
+def check_router_presence(iface, log, timeout=3.0):
+    """Проверить, виден ли роутер по ARP. Это лишь предварительная оценка."""
+    log.step("Поиск роутера на %s" % ROUTER_IP)
+    if not have("ip"):
+        log.info("утилита ip недоступна — проверка пропущена")
+        return None
+
+    mac, state = arp_probe(iface, ROUTER_IP, timeout=timeout)
+    if mac:
+        log.ok("устройство отвечает: %s (%s)" % (mac, state))
+        log.info("это может быть и другой роутер в сети — окончательно "
+                 "подтвердит только TFTP-запрос")
+        return mac
+
+    log.info("ответа нет")
+    log.info("в режиме восстановления роутер обычно молчит до момента, "
+             "когда сам попросит файл — это нормально")
+    return None
+
+
+def print_firmware(fw, log):
+    log.step("Прошивка %s" % os.path.basename(fw.path))
+    log.info("размер:   %s (%d байт)" % (human_size(fw.size), fw.size))
+    log.info("модель:   %s" % fw.model)
+    log.info("флаги:    0x%08x" % fw.flags)
+    if fw.version:
+        log.info("версия:   %s" % fw.version)
+    log.info("CRC32:    0x%08x" % fw.crc_stored)
+    if fw.crc_ok:
+        log.ok("контрольная сумма совпадает")
+    else:
+        log.err("контрольная сумма НЕ совпадает (расчёт 0x%08x)" % fw.crc_calc)
+    log.info("роутер может запросить: %s" % ", ".join(fw.expected_names()))
+
+
+def confirm(prompt, assume_yes=False):
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = input("%s [y/N]: " % prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in ("y", "yes", "д", "да")
+
+
+# -- команды CLI -------------------------------------------------------------
+
+
+def cmd_info(args):
+    log = Log()
+    fw = Firmware.load(args.firmware)
+    print_firmware(fw, log)
+    return 0 if fw.crc_ok else 1
+
+
+def cmd_detect(args):
+    log = Log()
+    fw = Firmware.load(args.firmware) if args.firmware else None
+    if fw:
+        print_firmware(fw, log)
+
+    iface = pick_interface(args.interface)
+    ip_added = []
+    try:
+        check_interface(iface, log, set_ip=args.set_ip, ip_added=ip_added)
+        check_router_presence(iface, log)
+
+        log.step("Ожидание запроса по TFTP (порт %d)" % args.port)
+        log.info("переведите роутер в режим восстановления: зажмите Reset, "
+                 "подайте питание, отпустите когда индикатор Status замигает")
+        log.info("остановить: Ctrl+C")
+
+        server = TFTPServer(
+            fw, port=args.port, expect_peer=None, serve=False, log=log
+        )
+        report = server.run(max_wait=args.wait or None)
+    finally:
+        for cidr in ip_added:
+            iface_del_ip(iface, cidr)
+
+    if not report:
+        log.err("роутер не обнаружен")
+        return 1
+
+    print()
+    log.step("Итог обнаружения")
+    log.info("адрес:            %s:%d" % (report["peer"][0], report["peer"][1]))
+    log.info("запрошенный файл: %s" % report["filename"])
+    if report["name_matches"] is True:
+        log.ok("имя совпадает с указанной прошивкой")
+    elif report["name_matches"] is False and fw:
+        log.warn("имя не совпадает: прошивка для %s" % fw.model)
+    log.ok("роутер действительно вышел на связь")
+    return 0
+
+
+def cmd_flash(args):
+    log = Log()
+    fw = Firmware.load(args.firmware)
+    print_firmware(fw, log)
+
+    if not fw.crc_ok:
+        log.err("прошивка повреждена — прошивать нельзя")
+        return 2
+
+    iface = pick_interface(args.interface)
+    ip_added = []
+    status = 1
+    try:
+        check_interface(iface, log, set_ip=args.set_ip, ip_added=ip_added)
+        check_router_presence(iface, log)
+
+        print()
+        log.step("Готовность к восстановлению")
+        log.info("дальше роутер сам заберёт файл и запишет его во flash —")
+        log.info("текущие настройки роутера будут потеряны")
+        if not confirm("Продолжить?", assume_yes=args.yes):
+            log.warn("отменено пользователем")
+            return 130
+
+        log.step("Ожидание запроса по TFTP (порт %d)" % args.port)
+        log.info("зажмите Reset, подайте питание, отпустите когда Status замигает")
+        log.info("остановить: Ctrl+C")
+
+        server = TFTPServer(
+            fw, port=args.port, expect_peer=args.expect_peer,
+            blksize=args.blksize, timeout=args.timeout,
+            retries=args.retries, serve=True, log=log,
+        )
+        report = server.run(max_wait=args.wait or None)
+
+        if not report:
+            log.err("роутер не обнаружен — файл не передан")
+            return 1
+
+        if report.get("served"):
+            print()
+            log.step("Готово")
+            log.ok("прошивка передана: %s" % human_size(report["bytes"]))
+            log.info("роутер записывает образ и перезагрузится сам")
+            log.info("не выключайте питание до окончания записи")
+            status = 0
+        else:
+            log.err("файл не передан: %s" % report.get("error", "неизвестная причина"))
+            status = 1
+    finally:
+        for cidr in ip_added:
+            iface_del_ip(iface, cidr)
+            log.info("адрес %s снят с %s" % (cidr, iface))
+
+    return status
+
+
+# ----------------------------------------------------------------------- CLI
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="kn-recovery",
+        description="Восстановление KeeneticOS по TFTP (Linux CLI).",
+        epilog="Пример: sudo kn-recovery flash KN-1221_recovery.bin --set-ip",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", action="version",
+                        version="kn-recovery %s" % __version__)
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-i", "--interface", metavar="ИМЯ",
+                        help="сетевой интерфейс (по умолчанию определяется сам)")
+    common.add_argument("--set-ip", action="store_true",
+                        help="добавить адрес %s/%d и снять его после работы"
+                             % (PC_IP, PC_PREFIX))
+    common.add_argument("-p", "--port", type=int, default=TFTP_PORT,
+                        help="порт TFTP (по умолчанию %(default)s)")
+
+    sub = parser.add_subparsers(dest="cmd", metavar="КОМАНДА")
+
+    p_info = sub.add_parser("info", help="показать параметры прошивки")
+    p_info.add_argument("firmware", help="файл прошивки Keenetic")
+    p_info.set_defaults(func=cmd_info)
+
+    p_det = sub.add_parser(
+        "detect", parents=[common],
+        help="только найти роутер, ничего не передавать",
+    )
+    p_det.add_argument("firmware", nargs="?",
+                       help="прошивка (необязательно, для сверки имени)")
+    p_det.add_argument("-w", "--wait", type=float, default=0,
+                       help="ждать не дольше N секунд (0 — бесконечно)")
+    p_det.set_defaults(func=cmd_detect)
+
+    p_flash = sub.add_parser(
+        "flash", parents=[common],
+        help="найти роутер и отдать ему прошивку",
+    )
+    p_flash.add_argument("firmware", help="файл прошивки Keenetic")
+    p_flash.add_argument("-w", "--wait", type=float, default=0,
+                         help="ждать не дольше N секунд (0 — бесконечно)")
+    p_flash.add_argument("-y", "--yes", action="store_true",
+                         help="не спрашивать подтверждение")
+    p_flash.add_argument("--blksize", type=int, default=DEFAULT_BLKSIZE,
+                         help="размер блока TFTP (по умолчанию %(default)s)")
+    p_flash.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                         help="таймаут блока в секундах (по умолчанию %(default)s)")
+    p_flash.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
+                         help="повторов на блок (по умолчанию %(default)s)")
+    p_flash.add_argument("--expect-peer", default=ROUTER_IP,
+                         help="ожидаемый адрес роутера (по умолчанию %(default)s)")
+    p_flash.set_defaults(func=cmd_flash)
+
+    return parser
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+
+    # Короткая форма: kn-recovery KN-1221_recovery.bin
+    if argv and not argv[0].startswith("-") and argv[0] not in ("info", "detect", "flash"):
+        argv = ["flash"] + argv
+
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 2
+
+    # root нужен для порта < 1024 и для правки адресов; на высоком порту
+    # без --set-ip программа работает и от обычного пользователя.
+    needs_root = getattr(args, "cmd", None) != "info" and (
+        getattr(args, "port", TFTP_PORT) < 1024 or getattr(args, "set_ip", False)
+    )
+    if needs_root and os.geteuid() != 0:
+        print("kn-recovery: нужен root — порт %d или смена адреса требуют "
+              "прав администратора" % getattr(args, "port", TFTP_PORT),
+              file=sys.stderr)
+        print("запустите через sudo", file=sys.stderr)
+        return 2
+
+    def on_sigint(signum, frame):
+        print()
+        print("прервано пользователем")
+        sys.exit(130)
+
+    signal.signal(signal.SIGINT, on_sigint)
+
+    try:
+        return args.func(args)
+    except FirmwareError as exc:
+        print("kn-recovery: %s" % exc, file=sys.stderr)
+        return 2
+    except SystemError_ as exc:
+        print("kn-recovery: %s" % exc, file=sys.stderr)
+        return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())
